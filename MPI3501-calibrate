@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+# ============================================================================
+# MPI3501-calibrate — 4-Corner Touchscreen Calibration Utility for MPI3501
+# ============================================================================
+# Reads raw XPT2046 / ADS7846 touch events directly from /dev/input/event*,
+# asks you to touch the 4 corners of the 3.5" screen (Top-Left, Top-Right,
+# Bottom-Left, Bottom-Right), computes the exact 3x3 homogeneous libinput
+# CalibrationMatrix (handling any axis swap, inversion, and margin scaling),
+# saves it permanently to /etc/X11/xorg.conf.d/99-mpi3501-touch.conf, and
+# applies it live to the running X11 session!
+#
+# Usage:
+#   sudo ./MPI3501-calibrate
+#   (or after installation: sudo mpi3501-calibrate)
+# ============================================================================
+
+import os
+import sys
+import glob
+import time
+import struct
+import subprocess
+
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_ABS = 0x03
+ABS_X = 0x00
+ABS_Y = 0x01
+BTN_TOUCH = 0x14a  # 330
+
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+
+
+def find_ads7846_device():
+    for sys_path in sorted(glob.glob("/sys/class/input/event*/device/name")):
+        try:
+            name = open(sys_path, "r").read().strip()
+            if "ADS7846" in name or "XPT2046" in name:
+                ev_name = sys_path.split("/")[4]
+                return f"/dev/input/{ev_name}", name
+        except Exception:
+            pass
+    return None, None
+
+
+def get_abs_limits(dev_node):
+    ev_name = os.path.basename(dev_node)
+    # Default factory bounds in mpi3501.dtbo
+    xmin, xmax = 268, 3880
+    ymin, ymax = 227, 3936
+    try:
+        uevent = f"/sys/class/input/{ev_name}/device/Capabilities/abs"
+        # Check kernel input_absinfo via python ioctl EVIOCGABS if available
+        import fcntl
+        fd = os.open(dev_node, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            # EVIOCGABS(axis) = _IOR('E', 0x40 + axis, struct input_absinfo [6 ints])
+            buf = fcntl.ioctl(fd, 0x80184540 + ABS_X, b"\x00" * 24)
+            _, xmin, xmax, _, _, _ = struct.unpack("6i", buf)
+            buf = fcntl.ioctl(fd, 0x80184540 + ABS_Y, b"\x00" * 24)
+            _, ymin, ymax, _, _, _ = struct.unpack("6i", buf)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+    return xmin, xmax, ymin, ymax
+
+
+def capture_single_touch(dev_node, label):
+    print(f"\n>>> Touch and HOLD [{label}] corner of the 3.5\" screen, then release...")
+    fd = os.open(dev_node, os.O_RDONLY)
+    xs, ys = [], []
+    cur_x, cur_y = None, None
+    touching = False
+    try:
+        while True:
+            data = os.read(fd, EVENT_SIZE)
+            if len(data) < EVENT_SIZE:
+                continue
+            _, _, ev_type, ev_code, ev_val = struct.unpack(EVENT_FORMAT, data)
+            if ev_type == EV_ABS:
+                if ev_code == ABS_X:
+                    cur_x = ev_val
+                elif ev_code == ABS_Y:
+                    cur_y = ev_val
+            elif ev_type == EV_KEY and ev_code == BTN_TOUCH:
+                if ev_val == 1:
+                    touching = True
+                    xs.clear()
+                    ys.clear()
+                elif ev_val == 0 and touching:
+                    if len(xs) >= 2:
+                        break
+                    touching = False
+            elif ev_type == EV_SYN and touching:
+                if cur_x is not None and cur_y is not None:
+                    xs.append(cur_x)
+                    ys.append(cur_y)
+    finally:
+        os.close(fd)
+
+    # Trim first/last sample if enough samples exist to avoid lift-off edge
+    if len(xs) > 4:
+        xs = sorted(xs)[1:-1]
+        ys = sorted(ys)[1:-1]
+    avg_x = sum(xs) / len(xs)
+    avg_y = sum(ys) / len(ys)
+    print(f"    Recorded [{label}]: raw X = {avg_x:.1f}, raw Y = {avg_y:.1f}")
+    time.sleep(0.4)
+    return avg_x, avg_y
+
+
+def solve_3x3(A, B):
+    # Gaussian elimination for 3x3 system
+    M = [row[:] + [b] for row, b in zip(A, B)]
+    for i in range(3):
+        pivot = max(range(i, 3), key=lambda r: abs(M[r][i]))
+        M[i], M[pivot] = M[pivot], M[i]
+        div = M[i][i]
+        if abs(div) < 1e-9:
+            raise ValueError("Singular calibration points (did you tap the same corner twice?)")
+        M[i] = [v / div for v in M[i]]
+        for r in range(3):
+            if r != i:
+                factor = M[r][i]
+                M[r] = [M[r][c] - factor * M[i][c] for c in range(4)]
+    return [M[0][3], M[1][3], M[2][3]]
+
+
+def main():
+    if os.geteuid() != 0:
+        print("[ERROR] Please run with sudo: sudo mpi3501-calibrate")
+        sys.exit(1)
+
+    dev_node, dev_name = find_ads7846_device()
+    if not dev_node:
+        print("[ERROR] Could not find ADS7846 / XPT2046 Touchscreen in /sys/class/input.")
+        sys.exit(1)
+
+    xmin, xmax, ymin, ymax = get_abs_limits(dev_node)
+    print("========================================================")
+    print("  MPI3501 4-Corner Touchscreen Calibration")
+    print(f"  Device     : {dev_name} ({dev_node})")
+    print(f"  ADC Range  : X=[{xmin}..{xmax}], Y=[{ymin}..{ymax}]")
+    print("========================================================")
+    print("Tap the 4 corners of the 3.5\" display about 5mm from the edge.")
+
+    # Normalized target coordinates (margin = 5% from edges)
+    margin = 0.05
+    targets = [
+        ("TOP-LEFT",     margin,       margin),
+        ("TOP-RIGHT",    1.0 - margin, margin),
+        ("BOTTOM-LEFT",  margin,       1.0 - margin),
+        ("BOTTOM-RIGHT", 1.0 - margin, 1.0 - margin),
+    ]
+
+    norm_inputs = []
+    for label, tx, ty in targets:
+        rx, ry = capture_single_touch(dev_node, label)
+        nx = (rx - xmin) / float(xmax - xmin)
+        ny = (ry - ymin) / float(ymax - ymin)
+        norm_inputs.append((nx, ny, tx, ty))
+
+    # Least-squares fit: [x_in, y_in, 1] -> x_out and y_out
+    ATA = [[0.0] * 3 for _ in range(3)]
+    ATbx = [0.0] * 3
+    ATby = [0.0] * 3
+    for nx, ny, tx, ty in norm_inputs:
+        v = [nx, ny, 1.0]
+        for r in range(3):
+            ATbx[r] += v[r] * tx
+            ATby[r] += v[r] * ty
+            for c in range(3):
+                ATA[r][c] += v[r] * v[c]
+
+    cx = solve_3x3(ATA, ATbx)
+    cy = solve_3x3(ATA, ATby)
+
+    matrix_str = f"{cx[0]:.4f} {cx[1]:.4f} {cx[2]:.4f} {cy[0]:.4f} {cy[1]:.4f} {cy[2]:.4f} 0 0 1"
+    print("\n========================================================")
+    print(f"  Computed CalibrationMatrix:\n    {matrix_str}")
+    print("========================================================")
+
+    conf_path = "/etc/X11/xorg.conf.d/99-mpi3501-touch.conf"
+    os.makedirs(os.path.dirname(conf_path), exist_ok=True)
+    with open(conf_path, "w") as f:
+        f.write(f"""# Custom 4-Corner Calibrated XPT2046 / ADS7846 Touchscreen Matrix
+Section "InputClass"
+    Identifier "MPI3501 XPT2046 Touchscreen"
+    MatchProduct "ADS7846 Touchscreen"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+    Option "CalibrationMatrix" "{matrix_str}"
+EndSection
+""")
+    print(f"  Saved permanently -> {conf_path}")
+
+    # Apply live via DISPLAY=:0 xinput if Xorg is running
+    try:
+        env = os.environ.copy()
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XAUTHORITY", "/home/" + (os.environ.get("SUDO_USER") or "pi") + "/.Xauthority")
+        cmd = ["xinput", "set-prop", "ADS7846 Touchscreen", "libinput Calibration Matrix"] + matrix_str.split()
+        subprocess.run(cmd, env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("  Applied live to current X11 session! (Or run 'sudo reboot' to reload X11).")
+    except Exception:
+        print("  Run 'sudo reboot' to apply the new touch calibration.")
+
+
+if __name__ == "__main__":
+    main()

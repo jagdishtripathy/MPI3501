@@ -17,7 +17,7 @@
  *   - Pin 23 (GPIO 11)          : SPI0 SCLK
  *
  * Compile directly with dtc (no C preprocessor required):
- *   dtc -@ -I dts -O dtb -o mpi3501.dtbo overlays/mpi3501-overlay.dts
+ *   dtc -@ -I dts -O dtb -o overlays/mpi3501.dtbo overlays/mpi3501-overlay.dts
  */
 
 /dts-v1/;
@@ -117,16 +117,30 @@
 				interrupt-parent = <&gpio>;
 				pendown-gpio = <&gpio 17 1>; /* 1 = GPIO_ACTIVE_LOW */
 
-				/* Factory MPI3501 calibration bounds (verified against goodtft/LCD-show & UNOQ_XPT2046) */
+				/* Factory MPI3501 ADC bounds (from goodtft/LCD-show) */
 				ti,x-min = /bits/ 16 <268>;
 				ti,x-max = /bits/ 16 <3880>;
 				ti,y-min = /bits/ 16 <227>;
 				ti,y-max = /bits/ 16 <3936>;
-				ti,x-plate-ohms = /bits/ 16 <60>;
-				ti,pressure-max = /bits/ 16 <255>;
-				ti,debounce-max = /bits/ 16 <10>;
-				ti,debounce-tol = /bits/ 16 <30>;
-				ti,debounce-rep = /bits/ 16 <1>;
+
+				/*
+				 * CRITICAL FIX for dead zones on high-X side of the screen:
+				 * In drivers/input/touchscreen/ads7846.c:
+				 *   Rt = (z2 - z1) * x_plate_ohms * x / (4096 * z1)
+				 *   if (Rt > pressure_max) return; // drops touch!
+				 * With x_plate_ohms=60..100 and pressure_max=255, touches where
+				 * x > 2500 produce Rt > 255 and get silently dropped!
+				 * Setting x-plate-ohms=15 and pressure-max=4095 prevents false drops.
+				 */
+				ti,x-plate-ohms = /bits/ 16 <15>;
+				ti,pressure-max = /bits/ 16 <4095>;
+
+				/* Settling & pen-up recheck to prevent lift-off mistouches */
+				ti,settle-delay-usec = /bits/ 16 <150>;
+				ti,penirq-recheck-delay-usecs = /bits/ 16 <100>;
+				ti,debounce-max = /bits/ 16 <5>;
+				ti,debounce-tol = /bits/ 16 <300>;
+				ti,debounce-rep = /bits/ 16 <0>;
 				wakeup-source;
 			};
 		};

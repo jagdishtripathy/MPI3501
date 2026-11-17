@@ -1,11 +1,13 @@
-# Ensure Linux shell scripts and Device Tree files always use LF line endings
+# Ensure Linux shell/python scripts and Device Tree files always use LF line endings
 * text=auto
 *.sh text eol=lf
 *.dts text eol=lf
+*.dtbo binary
 *.conf text eol=lf
 MPI3501-show text eol=lf
 MPI3501-hdmi text eol=lf
 MPI3501-rotate text eol=lf
+MPI3501-calibrate text eol=lf
 MPI3501-diag text eol=lf
 LCD35-show text eol=lf
 LCD-hdmi text eol=lf

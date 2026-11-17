@@ -52,10 +52,10 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: sudo ./MPI3501-show [180|0|90|270|landscape|portrait] [--speed 16000000] [--no-reboot]"
             echo ""
             echo "Rotations (DRM ili9486 driver):"
-            echo "  180 / landscape         : 480x320 Landscape (default, matches UNOQ rotation 1)"
-            echo "  0   / landscape-flipped : 480x320 Landscape inverted (matches UNOQ rotation 3)"
-            echo "  90  / portrait          : 320x480 Portrait (matches UNOQ rotation 2)"
-            echo "  270 / portrait-flipped  : 320x480 Portrait inverted (matches UNOQ rotation 0)"
+            echo "  180 / landscape         : 480x320 Landscape (default, matches goodtft rotate=90)"
+            echo "  0   / landscape-flipped : 480x320 Landscape inverted (matches goodtft rotate=270)"
+            echo "  90  / portrait          : 320x480 Portrait (matches goodtft rotate=0)"
+            echo "  270 / portrait-flipped  : 320x480 Portrait inverted (matches goodtft rotate=180)"
             exit 0
             ;;
         *)
@@ -108,26 +108,24 @@ if [[ -f "${CMDLINE_TXT}" && ! -f "${CMDLINE_TXT}.mpi3501.bak" ]]; then
 fi
 
 # ============================================================================
-# 2. Compile and install custom mpi3501.dtbo Device Tree Overlay
+# 2. Install custom mpi3501.dtbo Device Tree Overlay
 # ============================================================================
-echo "[2/7] Building and installing Device Tree Overlay..."
-OVERLAY_NAME="mpi3501"
+echo "[2/7] Installing custom mpi3501.dtbo Device Tree Overlay..."
 DTS_FILE="${SCRIPT_DIR}/overlays/mpi3501-overlay.dts"
-
-if ! command -v dtc >/dev/null 2>&1; then
-    echo "      'dtc' not found; attempting to install device-tree-compiler..."
-    apt-get update -qq && apt-get install -y -qq device-tree-compiler || true
-fi
+PREBUILT_DTBO="${SCRIPT_DIR}/overlays/mpi3501.dtbo"
 
 if command -v dtc >/dev/null 2>&1 && [[ -f "${DTS_FILE}" ]]; then
     dtc -@ -I dts -O dtb -o "${OVERLAYS_DIR}/mpi3501.dtbo" "${DTS_FILE}" 2>/dev/null
-    echo "      Installed custom overlay -> ${OVERLAYS_DIR}/mpi3501.dtbo"
-    DTOVERLAY_LINE="dtoverlay=mpi3501,speed=${SPI_SPEED},rotate=${ROTATION}"
+    echo "      Compiled & installed -> ${OVERLAYS_DIR}/mpi3501.dtbo"
+elif [[ -f "${PREBUILT_DTBO}" ]]; then
+    cp -f "${PREBUILT_DTBO}" "${OVERLAYS_DIR}/mpi3501.dtbo"
+    echo "      Installed pre-built overlay -> ${OVERLAYS_DIR}/mpi3501.dtbo"
 else
-    echo "      [WARN] dtc unavailable offline; using built-in kernel piscreen,drm overlay."
-    # Note: built-in piscreen.dtbo has ti,swap-xy enabled by default, so pass swapxy to normalize raw axes
-    DTOVERLAY_LINE="dtoverlay=piscreen,drm,speed=${SPI_SPEED},rotate=${ROTATION},swapxy"
+    echo "[ERROR] Neither dtc nor overlays/mpi3501.dtbo found."
+    exit 1
 fi
+
+DTOVERLAY_LINE="dtoverlay=mpi3501,speed=${SPI_SPEED},rotate=${ROTATION}"
 
 # ============================================================================
 # 3. Update config.txt (Enable SPI, disable HDMI Primary KMS hijack, load DTBO)
@@ -160,7 +158,6 @@ if [[ -f "${CMDLINE_TXT}" ]]; then
     # Remove any old fbcon mappings or one-time mpi3501-setup systemd.run hooks
     sed -i -E 's/ ?fbcon=map:[0-9]+//g; s/ ?fbcon=font:[^ ]+//g' "${CMDLINE_TXT}"
     sed -i -E 's| ?systemd\.run=/boot(/firmware)?/mpi3501-setup\.sh||g' "${CMDLINE_TXT}"
-    # Only strip systemd.run_success_action and systemd.unit if no other systemd.run (like firstrun.sh) remains
     if ! grep -q "systemd.run=" "${CMDLINE_TXT}"; then
         sed -i -E 's/ ?systemd\.run_success_action=[^ ]+//g; s/ ?systemd\.unit=[^ ]+//g' "${CMDLINE_TXT}"
     fi
@@ -179,7 +176,6 @@ echo "[5/7] Configuring Desktop display server (X11 / Xorg)..."
 if command -v raspi-config >/dev/null 2>&1; then
     raspi-config nonint do_wayland W1 || true
     echo "      Switched Raspberry Pi OS Desktop session to X11 (W1)."
-    # If lightdm (Desktop GUI) is installed and old LCD-show forced B2 (console), restore B4 (Desktop Autologin)
     if dpkg -l lightdm >/dev/null 2>&1; then
         raspi-config nonint do_boot_behaviour B4 || true
     fi
@@ -217,23 +213,24 @@ Section "OutputClass"
 EndSection
 EOF
 
-# Select 3x3 homogeneous libinput CalibrationMatrix matching UNOQ_XPT2046::applyRotation
+# Exact 3x3 homogeneous libinput CalibrationMatrix matched to goodtft/LCD-show
+# factory calibration (usr/99-calibration.conf-35-{0,90,180,270}) and fb_ili9486 <-> ili9486 DRM:
+#   DRM 180 (MADCTL=0x20 MV, goodtft rotate=90)     : SwapAxes=1, X=(3936->227 inv), Y=(268->3880 norm) => x' = 1 - y, y' = x
+#   DRM 0   (MADCTL=0xE0 MV|MY|MX, goodtft rot=270) : SwapAxes=1, X=(227->3936 norm), Y=(3880->268 inv) => x' = y, y' = 1 - x
+#   DRM 90  (MADCTL=0x80 MY, goodtft rotate=0)      : SwapAxes=0, X=(268->3880 norm), Y=(227->3936 norm)=> x' = x, y' = y
+#   DRM 270 (MADCTL=0x40 MX, goodtft rotate=180)    : SwapAxes=0, X=(3880->268 inv), Y=(3936->227 inv)  => x' = 1 - x, y' = 1 - y
 case "${ROTATION}" in
     180)
-        # Landscape 480x320 (MADCTL_MV | MADCTL_BGR): x' = y, y' = 1 - x
-        CAL_MATRIX="0 1 0 -1 0 1 0 0 1"
-        ;;
-    0)
-        # Landscape 480x320 inverted (MADCTL_MV | MY | MX | BGR): x' = 1 - y, y' = x
         CAL_MATRIX="0 -1 1 1 0 0 0 0 1"
         ;;
+    0)
+        CAL_MATRIX="0 1 0 -1 0 1 0 0 1"
+        ;;
     90)
-        # Portrait 320x480 (MADCTL_MY | MADCTL_BGR): x' = 1 - x, y' = 1 - y
-        CAL_MATRIX="-1 0 1 0 -1 1 0 0 1"
+        CAL_MATRIX="1 0 0 0 1 0 0 0 1"
         ;;
     270)
-        # Portrait 320x480 inverted (MADCTL_MX | MADCTL_BGR): x' = x, y' = y
-        CAL_MATRIX="1 0 0 0 1 0 0 0 1"
+        CAL_MATRIX="-1 0 1 0 -1 1 0 0 1"
         ;;
 esac
 
@@ -252,7 +249,7 @@ echo "      Installed /etc/X11/xorg.conf.d/99-mpi3501.conf"
 echo "      Installed /etc/X11/xorg.conf.d/99-mpi3501-touch.conf (Matrix: ${CAL_MATRIX})"
 
 # ============================================================================
-# 7. Install global CLI commands in /usr/local/driver/mpi3501 & /usr/local/bin
+# 7. Install global CLI commands in /usr/local/share/mpi3501-driver & /usr/local/bin
 # ============================================================================
 echo "[7/7] Installing global CLI commands..."
 INSTALL_DIR="/usr/local/share/mpi3501-driver"
@@ -262,17 +259,20 @@ if [[ "${SCRIPT_DIR}" != "${INSTALL_DIR}" ]]; then
     cp -f "${SCRIPT_DIR}/MPI3501-show" "${INSTALL_DIR}/"
     cp -f "${SCRIPT_DIR}/MPI3501-hdmi" "${INSTALL_DIR}/" 2>/dev/null || true
     cp -f "${SCRIPT_DIR}/MPI3501-rotate" "${INSTALL_DIR}/" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/MPI3501-calibrate" "${INSTALL_DIR}/" 2>/dev/null || true
     cp -f "${SCRIPT_DIR}/MPI3501-diag" "${INSTALL_DIR}/" 2>/dev/null || true
     cp -f "${SCRIPT_DIR}/overlays/mpi3501-overlay.dts" "${INSTALL_DIR}/overlays/" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/overlays/mpi3501.dtbo" "${INSTALL_DIR}/overlays/" 2>/dev/null || true
 fi
 
 chmod +x "${INSTALL_DIR}/MPI3501-"* 2>/dev/null || true
 ln -sf "${INSTALL_DIR}/MPI3501-show" /usr/local/bin/mpi3501-show
 ln -sf "${INSTALL_DIR}/MPI3501-hdmi" /usr/local/bin/mpi3501-hdmi
 ln -sf "${INSTALL_DIR}/MPI3501-rotate" /usr/local/bin/mpi3501-rotate
+ln -sf "${INSTALL_DIR}/MPI3501-calibrate" /usr/local/bin/mpi3501-calibrate
 ln -sf "${INSTALL_DIR}/MPI3501-diag" /usr/local/bin/mpi3501-diag
 
-echo "      Global commands ready: mpi3501-show, mpi3501-hdmi, mpi3501-rotate, mpi3501-diag"
+echo "      Global commands ready: mpi3501-show, mpi3501-hdmi, mpi3501-rotate, mpi3501-calibrate, mpi3501-diag"
 echo "========================================================"
 echo "  MPI3501 Driver Installation Complete!"
 echo "========================================================"

@@ -6,14 +6,15 @@
 #
 # What it does:
 #   1. Auto-detects the Raspberry Pi SD card 'bootfs' drive on Windows
-#   2. Copies the MPI3501 driver package to <SD_CARD>:\mpi3501\
-#      (available on the Pi at /boot/firmware/mpi3501/)
+#   2. Installs pre-compiled overlays\mpi3501.dtbo directly into
+#      <SD_CARD>:\overlays\mpi3501.dtbo and copies the full driver suite
+#      to <SD_CARD>:\mpi3501\ (available on the Pi at /boot/firmware/mpi3501/)
 #   3. Patches config.txt and cmdline.txt on the SD card so the 3.5" screen
-#      initializes immediately on boot (no white screen!)
+#      and calibrated XPT2046 touch controller initialize immediately on boot
 #   4. Sets up a one-time systemd boot hook (or hooks firstrun.sh) so the Pi
-#      automatically compiles mpi3501.dtbo, switches Wayland -> X11, sets
-#      ili9486 as PrimaryGPU, configures XPT2046 touch, and boots straight
-#      into the Desktop on the 3.5" screen with ZERO SSH or HDMI needed!
+#      automatically configures X11, sets ili9486 as PrimaryGPU, applies the
+#      corrected XPT2046 touch CalibrationMatrix, and boots straight into
+#      the Desktop on the 3.5" screen!
 # ============================================================================
 
 param(
@@ -61,12 +62,13 @@ if (-not $BootRoot) {
 
 Write-Host "[1/4] Found Raspberry Pi boot partition at: $BootRoot" -ForegroundColor Green
 
-# 2. Copy MPI3501 driver files onto the SD card at bootfs:\mpi3501\
+# 2. Install pre-built mpi3501.dtbo and copy MPI3501 driver files onto the SD card
 $TargetDir = Join-Path $BootRoot "mpi3501"
 $TargetOverlays = Join-Path $TargetDir "overlays"
+$BootOverlays = Join-Path $BootRoot "overlays"
 New-Item -ItemType Directory -Force -Path $TargetOverlays | Out-Null
 
-$FilesToCopy = @("MPI3501-show", "MPI3501-hdmi", "MPI3501-rotate", "MPI3501-diag", "LCD35-show", "LCD-hdmi", "README.md")
+$FilesToCopy = @("MPI3501-show", "MPI3501-hdmi", "MPI3501-rotate", "MPI3501-calibrate", "MPI3501-diag", "LCD35-show", "LCD-hdmi", "README.md")
 foreach ($File in $FilesToCopy) {
     $Src = Join-Path $ScriptDir $File
     if (Test-Path $Src) {
@@ -81,8 +83,14 @@ if (Test-Path $DtsSrc) {
     [System.IO.File]::WriteAllText((Join-Path $TargetOverlays "mpi3501-overlay.dts"), $DtsContent, (New-Object System.Text.UTF8Encoding($false)))
 }
 
-Write-Host "[2/4] Copied MPI3501 driver suite -> ${TargetDir}" -ForegroundColor Green
-Write-Host "      (Accessible on Raspberry Pi at /boot/firmware/mpi3501)"
+$DtboSrc = Join-Path $ScriptDir "overlays\mpi3501.dtbo"
+if (Test-Path $DtboSrc) {
+    Copy-Item -Force $DtboSrc (Join-Path $TargetOverlays "mpi3501.dtbo")
+    Copy-Item -Force $DtboSrc (Join-Path $BootOverlays "mpi3501.dtbo")
+    Write-Host "[2/4] Installed custom mpi3501.dtbo -> ${BootOverlays}\mpi3501.dtbo" -ForegroundColor Green
+} else {
+    Write-Host "[2/4] Copied MPI3501 driver suite -> ${TargetDir}" -ForegroundColor Green
+}
 
 # 3. Patch config.txt on the SD card
 $ConfigPath = Join-Path $BootRoot "config.txt"
@@ -99,13 +107,7 @@ $ConfigText = [regex]::Replace($ConfigText, '(?m)^[ \t]*(dtoverlay=vc4-f?kms-v3d
 # Remove any old MPI3501 block
 $ConfigText = [regex]::Replace($ConfigText, '(?s)\n?# --- BEGIN MPI3501 DRIVER ---.*?# --- END MPI3501 DRIVER ---\n?', '')
 
-# Use custom mpi3501.dtbo if already compiled in overlays, else built-in piscreen,drm for initial boot
-$OverlayDtbo = Join-Path $BootRoot "overlays\mpi3501.dtbo"
-if (Test-Path $OverlayDtbo) {
-    $OverlayLine = "dtoverlay=mpi3501,speed=$Speed,rotate=$Rotation"
-} else {
-    $OverlayLine = "dtoverlay=piscreen,drm,speed=$Speed,rotate=$Rotation,swapxy"
-}
+$OverlayLine = "dtoverlay=mpi3501,speed=$Speed,rotate=$Rotation"
 
 $DriverBlock = @"
 
@@ -125,7 +127,6 @@ $CmdlinePath = Join-Path $BootRoot "cmdline.txt"
 $FirstRunPath = Join-Path $BootRoot "firstrun.sh"
 $SetupScriptPath = Join-Path $BootRoot "mpi3501-setup.sh"
 
-# Always create mpi3501-setup.sh on the boot partition
 $SetupScript = @"
 #!/bin/bash
 set +e
@@ -139,7 +140,7 @@ for CMD in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
     fi
 done
 
-# 2. Run the full MPI3501-show installer (compiles DTBO, switches Wayland->X11, configures PrimaryGPU + Touch)
+# 2. Run the full MPI3501-show installer (installs DTBO, switches Wayland->X11, configures PrimaryGPU + Touch)
 if [ -f /boot/firmware/mpi3501/MPI3501-show ]; then
     bash /boot/firmware/mpi3501/MPI3501-show $Rotation --speed $Speed --no-reboot
 elif [ -f /boot/mpi3501/MPI3501-show ]; then
@@ -153,7 +154,6 @@ exit 0
 [System.IO.File]::WriteAllText($SetupScriptPath, $SetupScript, (New-Object System.Text.UTF8Encoding($false)))
 
 if (Test-Path $FirstRunPath) {
-    # Hook into Raspberry Pi Imager's existing firstrun.sh (before rm -f firstrun.sh)
     $FirstRunText = [System.IO.File]::ReadAllText($FirstRunPath) -replace "`r`n", "`n"
     if ($FirstRunText -notmatch "mpi3501-setup\.sh") {
         $Hook = @"
@@ -200,6 +200,6 @@ Write-Host "========================================================" -Foregroun
 Write-Host "  SD Card Patched Successfully!" -ForegroundColor Green
 Write-Host "  1. Safely eject the SD card from Windows." -ForegroundColor White
 Write-Host "  2. Plug the SD card & 3.5`" MPI3501 display into your Pi 4B." -ForegroundColor White
-Write-Host "  3. Power on! The Pi will configure the display, reboot once," -ForegroundColor White
+Write-Host "  3. Power on! The Pi will apply the updated touch driver, reboot once," -ForegroundColor White
 Write-Host "     and launch straight into the Desktop on the 3.5`" screen." -ForegroundColor White
 Write-Host "========================================================" -ForegroundColor Cyan

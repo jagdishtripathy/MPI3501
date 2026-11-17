@@ -102,7 +102,13 @@ Restores `dtoverlay=vc4-kms-v3d`, removes the SPI PrimaryGPU override, and reboo
 sudo mpi3501-show
 ```
 
-### 4. Run Hardware & Driver Diagnostics
+### 4. Run 4-Corner Touchscreen Calibration (Optional Fine-Tuning)
+```bash
+sudo mpi3501-calibrate
+```
+Reads raw XPT2046 ADC coordinates directly from `/dev/input/event*` as you tap the 4 corners (**Top-Left**, **Top-Right**, **Bottom-Left**, **Bottom-Right**), computes the exact 3×3 `libinput` `CalibrationMatrix` for your specific panel, saves it permanently to `/etc/X11/xorg.conf.d/99-mpi3501-touch.conf`, and applies it live to the running X11 session.
+
+### 5. Run Hardware & Driver Diagnostics
 ```bash
 mpi3501-diag
 ```
@@ -115,10 +121,12 @@ Prints the board model, kernel version, active `config.txt` overlays, SPI0 drive
 ```text
 RPI-Display-Driver/
 ├── overlays/
-│   └── mpi3501-overlay.dts      Custom Device Tree Overlay (ILI9486 DRM + XPT2046 Touch)
+│   ├── mpi3501-overlay.dts      Custom Device Tree Overlay source (ILI9486 DRM + XPT2046 Touch)
+│   └── mpi3501.dtbo             Pre-compiled Device Tree Overlay binary (no dtc needed)
 ├── MPI3501-show                 One-command Linux installer & display activator
 ├── MPI3501-hdmi                 One-command switch back to HDMI monitor
 ├── MPI3501-rotate               One-command display + touch rotation utility
+├── MPI3501-calibrate            Interactive 4-corner touchscreen calibration utility
 ├── MPI3501-diag                 Hardware, SPI, DRM, and touch diagnostics tool
 ├── LCD35-show                   Alias for MPI3501-show (drop-in replacement for LCD-show)
 ├── LCD-hdmi                     Alias for MPI3501-hdmi
