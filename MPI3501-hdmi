@@ -1,0 +1,99 @@
+#!/bin/bash
+# ============================================================================
+# MPI3501-hdmi — One-Command Switch Back to Standard HDMI Display
+# ============================================================================
+# Restores vc4-kms-v3d (HDMI acceleration), removes MPI3501 X11 PrimaryGPU
+# override, cleans up fbcon console mapping, and optionally restores Wayland.
+#
+# Usage:
+#   sudo ./MPI3501-hdmi [--wayland] [--no-reboot]
+# ============================================================================
+
+set -e
+
+RESTORE_WAYLAND=0
+DO_REBOOT=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --wayland)
+            RESTORE_WAYLAND=1
+            shift
+            ;;
+        --no-reboot)
+            DO_REBOOT=0
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: sudo ./MPI3501-hdmi [--wayland] [--no-reboot]"
+            exit 0
+            ;;
+        *)
+            echo "[ERROR] Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+    echo "[ERROR] Please run with sudo: sudo ./MPI3501-hdmi"
+    exit 1
+fi
+
+if [[ -f /boot/firmware/config.txt ]]; then
+    BOOT_DIR="/boot/firmware"
+elif [[ -f /boot/config.txt ]]; then
+    BOOT_DIR="/boot"
+else
+    echo "[ERROR] Could not find config.txt in /boot/firmware or /boot."
+    exit 1
+fi
+
+CONFIG_TXT="${BOOT_DIR}/config.txt"
+CMDLINE_TXT="${BOOT_DIR}/cmdline.txt"
+
+echo "========================================================"
+echo "  Switching Display Output -> HDMI (vc4-kms-v3d)"
+echo "========================================================"
+
+# 1. Re-enable vc4-kms-v3d and remove MPI3501 overlay block in config.txt
+echo "[1/4] Restoring HDMI KMS driver in ${CONFIG_TXT}..."
+sed -i -E 's/^#(dtoverlay=vc4-f?kms-v3d.*) # \[mpi3501-disabled\]/\1/' "${CONFIG_TXT}"
+sed -i '/# --- BEGIN MPI3501 DRIVER ---/,/# --- END MPI3501 DRIVER ---/d' "${CONFIG_TXT}"
+sed -i -E '/^[[:space:]]*dtoverlay=(piscreen|mpi3501|tft35a)/d' "${CONFIG_TXT}"
+
+# Ensure dtoverlay=vc4-kms-v3d is active
+if ! grep -q -E '^[[:space:]]*dtoverlay=vc4-f?kms-v3d' "${CONFIG_TXT}"; then
+    sed -i -E 's/^#[[:space:]]*(dtoverlay=vc4-kms-v3d)/\1/' "${CONFIG_TXT}"
+fi
+
+# 2. Remove fbcon mapping from cmdline.txt
+if [[ -f "${CMDLINE_TXT}" ]]; then
+    echo "[2/4] Restoring ${CMDLINE_TXT}..."
+    sed -i -E 's/ ?fbcon=map:[0-9]+//g; s/ ?fbcon=font:[^ ]+//g' "${CMDLINE_TXT}"
+fi
+
+# 3. Remove X11 PrimaryGPU override for ili9486
+echo "[3/4] Removing MPI3501 X11 overrides..."
+rm -f /etc/X11/xorg.conf.d/99-mpi3501.conf
+rm -f /etc/X11/xorg.conf.d/99-mpi3501-touch.conf
+
+# 4. Optionally switch back to Wayland if requested
+if [[ "${RESTORE_WAYLAND}" -eq 1 ]] && command -v raspi-config >/dev/null 2>&1; then
+    echo "[4/4] Restoring Wayland desktop session..."
+    raspi-config nonint do_wayland W2 || true
+else
+    echo "[4/4] Keeping X11 desktop session (pass --wayland to switch back to Wayland)."
+fi
+
+echo "========================================================"
+echo "  HDMI Display Output Restored!"
+echo "========================================================"
+
+if [[ "${DO_REBOOT}" -eq 1 ]]; then
+    echo "Rebooting in 3 seconds... (Press Ctrl+C to cancel)"
+    sleep 3
+    reboot
+else
+    echo "Reboot skipped (--no-reboot). Run 'sudo reboot' to apply changes."
+fi

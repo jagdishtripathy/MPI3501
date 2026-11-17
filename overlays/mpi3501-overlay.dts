@@ -1,0 +1,152 @@
+/*
+ * Device Tree Overlay for MPI3501 3.5" Raspberry Pi Touch Display
+ *
+ * Hardware:
+ *   - Display Controller : Ilitek ILI9486 (480x320, RGB565)
+ *   - SPI Bridge         : 74HC4040 x3 + 74HC04D (16-bit serial-to-parallel)
+ *   - Touch Controller   : XPT2046 / HR2046 (ADS7846 compatible, 8-bit SPI)
+ *
+ * Pin Mapping (26-pin Raspberry Pi GPIO header):
+ *   - Pin 18 (GPIO 24)          : LCD DC / RS
+ *   - Pin 22 (GPIO 25)          : LCD Reset (Active LOW on hardware)
+ *   - Pin 24 (GPIO 8, SPI0 CE0) : LCD Chip Select
+ *   - Pin 26 (GPIO 7, SPI0 CE1) : Touch Chip Select
+ *   - Pin 11 (GPIO 17)          : Touch Pen-Down Interrupt (Active LOW)
+ *   - Pin 19 (GPIO 10)          : SPI0 MOSI
+ *   - Pin 21 (GPIO 9)           : SPI0 MISO
+ *   - Pin 23 (GPIO 11)          : SPI0 SCLK
+ *
+ * Compile directly with dtc (no C preprocessor required):
+ *   dtc -@ -I dts -O dtb -o mpi3501.dtbo overlays/mpi3501-overlay.dts
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835", "brcm,bcm2711", "brcm,bcm2712";
+
+	/* Enable SPI0 controller */
+	fragment@0 {
+		target = <&spi0>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* Disable generic spidev on CE0 (used by ILI9486 LCD) */
+	fragment@1 {
+		target = <&spidev0>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	/* Disable generic spidev on CE1 (used by XPT2046 Touch) */
+	fragment@2 {
+		target = <&spidev1>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	/* Configure MPI3501 control GPIOs (leaves GPIO 22 / Pin 15 free) */
+	fragment@3 {
+		target = <&gpio>;
+		__overlay__ {
+			mpi3501_pins: mpi3501_pins {
+				brcm,pins = <17 25 24>;     /* T_IRQ, LCD_RST, LCD_DC */
+				brcm,function = <0 1 1>;    /* in, out, out */
+				brcm,pull = <2 0 0>;        /* pull-up on T_IRQ, none on outputs */
+			};
+		};
+	};
+
+	/* Configure ILI9486 LCD (CE0) and XPT2046 Touch (CE1) on SPI0 */
+	fragment@4 {
+		target = <&spi0>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mpi3501_lcd: mpi3501@0 {
+				compatible = "waveshare,rpi-lcd-35";
+				reg = <0>;
+				pinctrl-names = "default";
+				pinctrl-0 = <&mpi3501_pins>;
+
+				spi-max-frequency = <16000000>;
+				rotation = <180>;
+				rotate = <180>;
+				bgr;
+				fps = <30>;
+				buswidth = <8>;
+				regwidth = <16>;
+
+				/*
+				 * Note: In Linux drm_mipi_dbi (mipi_dbi_hw_reset), the driver asserts
+				 * reset with gpiod_set_value(0) and releases with gpiod_set_value(1).
+				 * Therefore GPIO_ACTIVE_HIGH (0) is required for DRM mode so physical
+				 * GPIO 25 goes LOW to reset and stays HIGH during normal operation.
+				 */
+				reset-gpios = <&gpio 25 0>; /* 0 = GPIO_ACTIVE_HIGH */
+				dc-gpios = <&gpio 24 0>;    /* 0 = GPIO_ACTIVE_HIGH */
+				debug = <0>;
+
+				/* Fallback init sequence if switched to legacy fbtft mode */
+				init = <0x10000b0 0x00
+				        0x1000011
+				        0x20000ff
+				        0x100003a 0x55
+				        0x1000036 0x28
+				        0x10000c2 0x44
+				        0x10000c5 0x00 0x00 0x00 0x00
+				        0x10000e0 0x0f 0x1f 0x1c 0x0c 0x0f 0x08 0x48 0x98 0x37 0x0a 0x13 0x04 0x11 0x0d 0x00
+				        0x10000e1 0x0f 0x32 0x2e 0x0b 0x0d 0x05 0x47 0x75 0x37 0x06 0x10 0x03 0x24 0x20 0x00
+				        0x10000e2 0x0f 0x32 0x2e 0x0b 0x0d 0x05 0x47 0x75 0x37 0x06 0x10 0x03 0x24 0x20 0x00
+				        0x1000011
+				        0x1000029>;
+			};
+
+			mpi3501_ts: mpi3501-ts@1 {
+				compatible = "ti,ads7846";
+				reg = <1>;
+
+				spi-max-frequency = <1000000>;
+				interrupts = <17 2>;        /* GPIO 17, high-to-low falling edge */
+				interrupt-parent = <&gpio>;
+				pendown-gpio = <&gpio 17 1>; /* 1 = GPIO_ACTIVE_LOW */
+
+				/* Factory MPI3501 calibration bounds (verified against goodtft/LCD-show & UNOQ_XPT2046) */
+				ti,x-min = /bits/ 16 <268>;
+				ti,x-max = /bits/ 16 <3880>;
+				ti,y-min = /bits/ 16 <227>;
+				ti,y-max = /bits/ 16 <3936>;
+				ti,x-plate-ohms = /bits/ 16 <60>;
+				ti,pressure-max = /bits/ 16 <255>;
+				ti,debounce-max = /bits/ 16 <10>;
+				ti,debounce-tol = /bits/ 16 <30>;
+				ti,debounce-rep = /bits/ 16 <1>;
+				wakeup-source;
+			};
+		};
+	};
+
+	__overrides__ {
+		speed =  <&mpi3501_lcd>,"spi-max-frequency:0";
+		rotate = <&mpi3501_lcd>,"rotation:0",
+		         <&mpi3501_lcd>,"rotate:0";
+		fps =    <&mpi3501_lcd>,"fps:0";
+		debug =  <&mpi3501_lcd>,"debug:0";
+		xohms =  <&mpi3501_ts>,"ti,x-plate-ohms;0";
+		xmin =   <&mpi3501_ts>,"ti,x-min;0";
+		xmax =   <&mpi3501_ts>,"ti,x-max;0";
+		ymin =   <&mpi3501_ts>,"ti,y-min;0";
+		ymax =   <&mpi3501_ts>,"ti,y-max;0";
+		invx =   <&mpi3501_ts>,"touchscreen-inverted-x?";
+		invy =   <&mpi3501_ts>,"touchscreen-inverted-y?";
+		swapxy = <&mpi3501_ts>,"touchscreen-swapped-x-y?";
+		legacy = <&mpi3501_lcd>,"compatible=ilitek,ili9486",
+		         <&mpi3501_lcd>,"reset-gpios:8=",<1>;
+	};
+};

@@ -1,0 +1,112 @@
+#!/bin/bash
+# ============================================================================
+# MPI3501-diag — Diagnostics Tool for MPI3501 3.5" RPi Display on Linux
+# ============================================================================
+# Inspects boot configuration, Device Tree Overlay status, SPI devices,
+# DRM/KMS cards, Framebuffers, XPT2046/ADS7846 touch input, and X11 rules.
+# ============================================================================
+
+echo "========================================================"
+echo "  MPI3501 Raspberry Pi Display Diagnostics"
+echo "========================================================"
+
+# 1. System & Kernel Info
+echo "--- System Info ---"
+if [[ -f /proc/device-tree/model ]]; then
+    echo "  Board  : $(tr -d '\0' < /proc/device-tree/model)"
+fi
+echo "  Kernel : $(uname -r) ($(uname -m))"
+if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    echo "  OS     : ${PRETTY_NAME}"
+fi
+
+# 2. Boot Config Status
+echo ""
+echo "--- Boot Configuration ---"
+if [[ -f /boot/firmware/config.txt ]]; then
+    BOOT_DIR="/boot/firmware"
+elif [[ -f /boot/config.txt ]]; then
+    BOOT_DIR="/boot"
+else
+    BOOT_DIR="NOT_FOUND"
+fi
+echo "  Boot Dir    : ${BOOT_DIR}"
+
+if [[ "${BOOT_DIR}" != "NOT_FOUND" ]]; then
+    if [[ -f "${BOOT_DIR}/overlays/mpi3501.dtbo" ]]; then
+        echo "  Custom DTBO : INSTALLED (${BOOT_DIR}/overlays/mpi3501.dtbo)"
+    else
+        echo "  Custom DTBO : NOT FOUND (will use built-in piscreen.dtbo if configured)"
+    fi
+    echo "  Active Overlay Lines in config.txt:"
+    grep -E '^[[:space:]]*(dtparam=spi|dtoverlay=)' "${BOOT_DIR}/config.txt" | sed 's/^/    /' || echo "    (none)"
+fi
+
+# 3. SPI Bus & Driver Binding
+echo ""
+echo "--- SPI0 Devices & Kernel Drivers ---"
+for dev in /sys/bus/spi/devices/spi0.*; do
+    if [[ -d "${dev}" ]]; then
+        name="$(basename "${dev}")"
+        modalias="$(cat "${dev}/modalias" 2>/dev/null || echo "unknown")"
+        if [[ -L "${dev}/driver" ]]; then
+            drv="$(basename "$(readlink "${dev}/driver")")"
+        else
+            drv="UNBOUND"
+        fi
+        echo "  ${name} : driver=${drv} (${modalias})"
+    fi
+done
+
+# 4. DRM / KMS & Framebuffer Status
+echo ""
+echo "--- DRM & Framebuffer Devices ---"
+for card in /sys/class/drm/card[0-9]; do
+    if [[ -d "${card}" ]]; then
+        cname="$(basename "${card}")"
+        if [[ -L "${card}/device/driver" ]]; then
+            cdrv="$(basename "$(readlink "${card}/device/driver")")"
+        else
+            cdrv="unknown"
+        fi
+        echo "  /dev/dri/${cname} : driver=${cdrv}"
+    fi
+done
+
+for fb in /sys/class/graphics/fb[0-9]; do
+    if [[ -d "${fb}" ]]; then
+        fbname="$(basename "${fb}")"
+        fbdrv="$(cat "${fb}/name" 2>/dev/null || echo "unknown")"
+        fbres="$(cat "${fb}/virtual_size" 2>/dev/null || echo "unknown")"
+        echo "  /dev/${fbname}     : name='${fbdrv}' size=${fbres}"
+    fi
+done
+
+# 5. Touchscreen Input Status
+echo ""
+echo "--- Touchscreen Input (XPT2046 / ADS7846) ---"
+if grep -q "ADS7846" /proc/bus/input/devices 2>/dev/null; then
+    echo "  Status : DETECTED (ADS7846 Touchscreen)"
+    awk '/ADS7846/{flag=1} flag{print "    " $0} /^$/{if(flag) exit}' /proc/bus/input/devices
+else
+    echo "  Status : NOT DETECTED in /proc/bus/input/devices"
+fi
+
+# 6. X11 & Display Server Configuration
+echo ""
+echo "--- Display Server & X11 Config ---"
+if [[ -f /etc/X11/xorg.conf.d/99-mpi3501.conf ]]; then
+    echo "  99-mpi3501.conf       : PRESENT (ili9486 PrimaryGPU enabled)"
+else
+    echo "  99-mpi3501.conf       : MISSING"
+fi
+
+if [[ -f /etc/X11/xorg.conf.d/99-mpi3501-touch.conf ]]; then
+    mat="$(grep CalibrationMatrix /etc/X11/xorg.conf.d/99-mpi3501-touch.conf | sed -E 's/.*"CalibrationMatrix"[[:space:]]+"([^"]+)".*/\1/')"
+    echo "  99-mpi3501-touch.conf : PRESENT (Matrix: ${mat})"
+else
+    echo "  99-mpi3501-touch.conf : MISSING"
+fi
+
+echo "========================================================"

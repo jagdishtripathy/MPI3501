@@ -1,0 +1,286 @@
+#!/bin/bash
+# ============================================================================
+# MPI3501-show — One-Command Driver Installer for 3.5" RPi Display (MPI3501)
+# ============================================================================
+# Supports Raspberry Pi 4B / 3B+ / 5 / Zero 2W on:
+#   - Raspberry Pi OS Bookworm (Debian 12) & Trixie (Debian 13)
+#   - Raspberry Pi OS Bullseye (Debian 11)
+#
+# Usage:
+#   sudo ./MPI3501-show [180|0|90|270|landscape|landscape-flipped|portrait|portrait-flipped] [--speed HZ] [--no-reboot]
+#
+# Default orientation: 180 (480x320 Landscape — matches UNOQ_MPI3501 setRotation(1))
+# ============================================================================
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROTATION="180"
+SPI_SPEED="16000000"
+DO_REBOOT=1
+
+# ============================================================================
+# Parse arguments
+# ============================================================================
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        0|landscape-flipped)
+            ROTATION="0"
+            shift
+            ;;
+        180|landscape)
+            ROTATION="180"
+            shift
+            ;;
+        90|portrait)
+            ROTATION="90"
+            shift
+            ;;
+        270|portrait-flipped)
+            ROTATION="270"
+            shift
+            ;;
+        --speed)
+            SPI_SPEED="$2"
+            shift 2
+            ;;
+        --no-reboot)
+            DO_REBOOT=0
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: sudo ./MPI3501-show [180|0|90|270|landscape|portrait] [--speed 16000000] [--no-reboot]"
+            echo ""
+            echo "Rotations (DRM ili9486 driver):"
+            echo "  180 / landscape         : 480x320 Landscape (default, matches UNOQ rotation 1)"
+            echo "  0   / landscape-flipped : 480x320 Landscape inverted (matches UNOQ rotation 3)"
+            echo "  90  / portrait          : 320x480 Portrait (matches UNOQ rotation 2)"
+            echo "  270 / portrait-flipped  : 320x480 Portrait inverted (matches UNOQ rotation 0)"
+            exit 0
+            ;;
+        *)
+            echo "[ERROR] Unknown argument: $1"
+            echo "Run 'sudo ./MPI3501-show --help' for usage."
+            exit 1
+            ;;
+    esac
+done
+
+if [[ $EUID -ne 0 ]]; then
+    echo "[ERROR] Please run with sudo: sudo ./MPI3501-show"
+    exit 1
+fi
+
+echo "========================================================"
+echo "  MPI3501 3.5\" RPi Display Driver Installer"
+echo "  Controller : Ilitek ILI9486 (16-bit SPI bridge)"
+echo "  Touch      : XPT2046 / HR2046 (ADS7846 driver)"
+echo "  Rotation   : ${ROTATION} deg"
+echo "  SPI Speed  : ${SPI_SPEED} Hz"
+echo "========================================================"
+
+# ============================================================================
+# 1. Detect boot partition paths (/boot/firmware vs /boot)
+# ============================================================================
+if [[ -f /boot/firmware/config.txt ]]; then
+    BOOT_DIR="/boot/firmware"
+elif [[ -f /boot/config.txt ]]; then
+    BOOT_DIR="/boot"
+else
+    echo "[ERROR] Could not find config.txt in /boot/firmware or /boot."
+    exit 1
+fi
+
+CONFIG_TXT="${BOOT_DIR}/config.txt"
+CMDLINE_TXT="${BOOT_DIR}/cmdline.txt"
+OVERLAYS_DIR="${BOOT_DIR}/overlays"
+
+echo "[1/7] Detected boot directory: ${BOOT_DIR}"
+
+# Create one-time backups of original files
+if [[ ! -f "${CONFIG_TXT}.mpi3501.bak" ]]; then
+    cp "${CONFIG_TXT}" "${CONFIG_TXT}.mpi3501.bak"
+    echo "      Backed up original config.txt -> ${CONFIG_TXT}.mpi3501.bak"
+fi
+if [[ -f "${CMDLINE_TXT}" && ! -f "${CMDLINE_TXT}.mpi3501.bak" ]]; then
+    cp "${CMDLINE_TXT}" "${CMDLINE_TXT}.mpi3501.bak"
+    echo "      Backed up original cmdline.txt -> ${CMDLINE_TXT}.mpi3501.bak"
+fi
+
+# ============================================================================
+# 2. Compile and install custom mpi3501.dtbo Device Tree Overlay
+# ============================================================================
+echo "[2/7] Building and installing Device Tree Overlay..."
+OVERLAY_NAME="mpi3501"
+DTS_FILE="${SCRIPT_DIR}/overlays/mpi3501-overlay.dts"
+
+if ! command -v dtc >/dev/null 2>&1; then
+    echo "      'dtc' not found; attempting to install device-tree-compiler..."
+    apt-get update -qq && apt-get install -y -qq device-tree-compiler || true
+fi
+
+if command -v dtc >/dev/null 2>&1 && [[ -f "${DTS_FILE}" ]]; then
+    dtc -@ -I dts -O dtb -o "${OVERLAYS_DIR}/mpi3501.dtbo" "${DTS_FILE}" 2>/dev/null
+    echo "      Installed custom overlay -> ${OVERLAYS_DIR}/mpi3501.dtbo"
+    DTOVERLAY_LINE="dtoverlay=mpi3501,speed=${SPI_SPEED},rotate=${ROTATION}"
+else
+    echo "      [WARN] dtc unavailable offline; using built-in kernel piscreen,drm overlay."
+    # Note: built-in piscreen.dtbo has ti,swap-xy enabled by default, so pass swapxy to normalize raw axes
+    DTOVERLAY_LINE="dtoverlay=piscreen,drm,speed=${SPI_SPEED},rotate=${ROTATION},swapxy"
+fi
+
+# ============================================================================
+# 3. Update config.txt (Enable SPI, disable HDMI Primary KMS hijack, load DTBO)
+# ============================================================================
+echo "[3/7] Updating ${CONFIG_TXT}..."
+
+# Comment out active vc4-kms-v3d or vc4-fkms-v3d so HDMI GPU does not hijack X11
+sed -i -E 's/^[[:space:]]*(dtoverlay=vc4-f?kms-v3d.*)/#\1 # [mpi3501-disabled]/' "${CONFIG_TXT}"
+
+# Remove any previous MPI3501 / piscreen / tft35a block
+sed -i '/# --- BEGIN MPI3501 DRIVER ---/,/# --- END MPI3501 DRIVER ---/d' "${CONFIG_TXT}"
+sed -i -E '/^[[:space:]]*dtoverlay=(piscreen|mpi3501|tft35a)/d' "${CONFIG_TXT}"
+
+cat >> "${CONFIG_TXT}" << EOF
+
+# --- BEGIN MPI3501 DRIVER ---
+[all]
+dtparam=spi=on
+${DTOVERLAY_LINE}
+# --- END MPI3501 DRIVER ---
+EOF
+
+echo "      Configured: ${DTOVERLAY_LINE}"
+
+# ============================================================================
+# 4. Update cmdline.txt for boot console on the 3.5" screen
+# ============================================================================
+if [[ -f "${CMDLINE_TXT}" ]]; then
+    echo "[4/7] Configuring boot console mapping in ${CMDLINE_TXT}..."
+    # Remove any old fbcon mappings or one-time mpi3501-setup systemd.run hooks
+    sed -i -E 's/ ?fbcon=map:[0-9]+//g; s/ ?fbcon=font:[^ ]+//g' "${CMDLINE_TXT}"
+    sed -i -E 's| ?systemd\.run=/boot(/firmware)?/mpi3501-setup\.sh||g' "${CMDLINE_TXT}"
+    # Only strip systemd.run_success_action and systemd.unit if no other systemd.run (like firstrun.sh) remains
+    if ! grep -q "systemd.run=" "${CMDLINE_TXT}"; then
+        sed -i -E 's/ ?systemd\.run_success_action=[^ ]+//g; s/ ?systemd\.unit=[^ ]+//g' "${CMDLINE_TXT}"
+    fi
+    # Append fbcon mapping so console appears on SPI display
+    sed -i -E 's/[[:space:]]*$//' "${CMDLINE_TXT}"
+    sed -i '1s/$/ fbcon=map:10 fbcon=font:ProFont6x11/' "${CMDLINE_TXT}"
+else
+    echo "[4/7] Skipping cmdline.txt (file not found)."
+fi
+
+# ============================================================================
+# 5. Switch Desktop session from Wayland (labwc/wayfire) to X11 (Xorg)
+#    and clean up any broken state left behind by old goodtft/LCD-show scripts
+# ============================================================================
+echo "[5/7] Configuring Desktop display server (X11 / Xorg)..."
+if command -v raspi-config >/dev/null 2>&1; then
+    raspi-config nonint do_wayland W1 || true
+    echo "      Switched Raspberry Pi OS Desktop session to X11 (W1)."
+    # If lightdm (Desktop GUI) is installed and old LCD-show forced B2 (console), restore B4 (Desktop Autologin)
+    if dpkg -l lightdm >/dev/null 2>&1; then
+        raspi-config nonint do_boot_behaviour B4 || true
+    fi
+else
+    echo "      raspi-config not found (Lite OS or custom distro); skipping Wayland switch."
+fi
+
+# Clean up any broken files installed by legacy goodtft/LCD-show
+rm -f /usr/share/X11/xorg.conf.d/99-fbturbo.conf \
+      /usr/share/X11/xorg.conf.d/99-fbturbo.~ \
+      /etc/X11/xorg.conf.d/99-fbturbo.conf \
+      /etc/X11/xorg.conf.d/99-calibration.conf \
+      /usr/share/X11/xorg.conf.d/45-evdev.conf
+
+for bp in /home/*/.bash_profile; do
+    if [[ -f "${bp}" ]] && grep -q "FRAMEBUFFER=/dev/fb1" "${bp}" 2>/dev/null; then
+        rm -f "${bp}"
+        echo "      Removed broken LCD-show .bash_profile (${bp})"
+    fi
+done
+
+# ============================================================================
+# 6. Configure Xorg PrimaryGPU (ili9486) and XPT2046 Touch CalibrationMatrix
+# ============================================================================
+echo "[6/7] Writing X11 PrimaryGPU and Touch Calibration rules..."
+mkdir -p /etc/X11/xorg.conf.d
+
+cat > /etc/X11/xorg.conf.d/99-mpi3501.conf << 'EOF'
+# Force Xorg modesetting driver to use the MPI3501 (ili9486 TinyDRM) display as PrimaryGPU
+Section "OutputClass"
+    Identifier "MPI3501 ILI9486 DRM Display"
+    MatchDriver "ili9486"
+    Driver "modesetting"
+    Option "PrimaryGPU" "true"
+EndSection
+EOF
+
+# Select 3x3 homogeneous libinput CalibrationMatrix matching UNOQ_XPT2046::applyRotation
+case "${ROTATION}" in
+    180)
+        # Landscape 480x320 (MADCTL_MV | MADCTL_BGR): x' = y, y' = 1 - x
+        CAL_MATRIX="0 1 0 -1 0 1 0 0 1"
+        ;;
+    0)
+        # Landscape 480x320 inverted (MADCTL_MV | MY | MX | BGR): x' = 1 - y, y' = x
+        CAL_MATRIX="0 -1 1 1 0 0 0 0 1"
+        ;;
+    90)
+        # Portrait 320x480 (MADCTL_MY | MADCTL_BGR): x' = 1 - x, y' = 1 - y
+        CAL_MATRIX="-1 0 1 0 -1 1 0 0 1"
+        ;;
+    270)
+        # Portrait 320x480 inverted (MADCTL_MX | MADCTL_BGR): x' = x, y' = y
+        CAL_MATRIX="1 0 0 0 1 0 0 0 1"
+        ;;
+esac
+
+cat > /etc/X11/xorg.conf.d/99-mpi3501-touch.conf << EOF
+# XPT2046 / ADS7846 Touchscreen Calibration for MPI3501 (Rotation: ${ROTATION} deg)
+Section "InputClass"
+    Identifier "MPI3501 XPT2046 Touchscreen"
+    MatchProduct "ADS7846 Touchscreen"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+    Option "CalibrationMatrix" "${CAL_MATRIX}"
+EndSection
+EOF
+
+echo "      Installed /etc/X11/xorg.conf.d/99-mpi3501.conf"
+echo "      Installed /etc/X11/xorg.conf.d/99-mpi3501-touch.conf (Matrix: ${CAL_MATRIX})"
+
+# ============================================================================
+# 7. Install global CLI commands in /usr/local/driver/mpi3501 & /usr/local/bin
+# ============================================================================
+echo "[7/7] Installing global CLI commands..."
+INSTALL_DIR="/usr/local/share/mpi3501-driver"
+mkdir -p "${INSTALL_DIR}/overlays"
+
+if [[ "${SCRIPT_DIR}" != "${INSTALL_DIR}" ]]; then
+    cp -f "${SCRIPT_DIR}/MPI3501-show" "${INSTALL_DIR}/"
+    cp -f "${SCRIPT_DIR}/MPI3501-hdmi" "${INSTALL_DIR}/" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/MPI3501-rotate" "${INSTALL_DIR}/" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/MPI3501-diag" "${INSTALL_DIR}/" 2>/dev/null || true
+    cp -f "${SCRIPT_DIR}/overlays/mpi3501-overlay.dts" "${INSTALL_DIR}/overlays/" 2>/dev/null || true
+fi
+
+chmod +x "${INSTALL_DIR}/MPI3501-"* 2>/dev/null || true
+ln -sf "${INSTALL_DIR}/MPI3501-show" /usr/local/bin/mpi3501-show
+ln -sf "${INSTALL_DIR}/MPI3501-hdmi" /usr/local/bin/mpi3501-hdmi
+ln -sf "${INSTALL_DIR}/MPI3501-rotate" /usr/local/bin/mpi3501-rotate
+ln -sf "${INSTALL_DIR}/MPI3501-diag" /usr/local/bin/mpi3501-diag
+
+echo "      Global commands ready: mpi3501-show, mpi3501-hdmi, mpi3501-rotate, mpi3501-diag"
+echo "========================================================"
+echo "  MPI3501 Driver Installation Complete!"
+echo "========================================================"
+
+if [[ "${DO_REBOOT}" -eq 1 ]]; then
+    echo "Rebooting in 3 seconds... (Press Ctrl+C to cancel)"
+    sleep 3
+    reboot
+else
+    echo "Reboot skipped (--no-reboot). Run 'sudo reboot' to activate the display."
+fi

@@ -1,0 +1,24 @@
+#!/bin/bash
+# ============================================================================
+# MPI3501-rotate — Rotate Display and Touch Calibration Together
+# ============================================================================
+# Usage:
+#   sudo ./MPI3501-rotate <180|0|90|270|landscape|landscape-flipped|portrait|portrait-flipped> [--no-reboot]
+# ============================================================================
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: sudo ./MPI3501-rotate <180|0|90|270|landscape|landscape-flipped|portrait|portrait-flipped> [--no-reboot]"
+    echo ""
+    echo "Orientations:"
+    echo "  180 / landscape         : 480x320 Landscape (default)"
+    echo "  0   / landscape-flipped : 480x320 Landscape inverted"
+    echo "  90  / portrait          : 320x480 Portrait"
+    echo "  270 / portrait-flipped  : 320x480 Portrait inverted"
+    exit 1
+fi
+
+exec "${SCRIPT_DIR}/MPI3501-show" "$@"
